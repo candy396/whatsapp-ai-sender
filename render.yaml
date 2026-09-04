@@ -1,18 +1,13 @@
 services:
   - type: web
     name: whatsapp-ai-sender
-    env: node
+    runtime: node
     plan: free
     buildCommand: npm install
     startCommand: npm start
     envVars:
       - key: PORT
-        value: 3000
+        value: "3000"
       - key: DEFAULT_COUNTRY_CODE
         value: "91"
-      - key: OPENAI_API_KEY
-        sync: false
-    disk:
-      name: whatsapp-session-data
-      mountPath: /app/data
-      sizeGB: 1
+

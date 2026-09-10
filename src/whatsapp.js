@@ -5,13 +5,12 @@ const qrcodeTerminal = require('qrcode-terminal');
 const path = require('path');
 const fs = require('fs');
 
-let sock = null;
-let qrCodeData = null;
-let connectionStatus = 'DISCONNECTED'; // DISCONNECTED, CONNECTING, CONNECTED
-let userInfo = null;
+const accounts = new Map();
+
 let eventCallbacks = {
   onQR: () => {},
   onStatusChange: () => {},
+  onAccountsUpdate: () => {},
   onLog: () => {}
 };
 
@@ -19,109 +18,257 @@ function setEventCallbacks(callbacks) {
   eventCallbacks = { ...eventCallbacks, ...callbacks };
 }
 
-async function initWhatsApp(sessionPath = path.join(__dirname, '../data/sessions')) {
-  try {
-    if (!fs.existsSync(sessionPath)) {
-      fs.mkdirSync(sessionPath, { recursive: true });
-    }
-
-    if (sock) {
-      try { sock.ev.removeAllListeners(); } catch (e) {}
-      try { sock.end(undefined); } catch (e) {}
-      sock = null;
-    }
-
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    let version;
-    try {
-      const versionRes = await fetchLatestBaileysVersion();
-      version = versionRes.version;
-    } catch (e) {
-      console.warn('Could not fetch latest Baileys version, using default fallback:', e.message);
-      version = [2, 3000, 1015901307];
-    }
-
-    eventCallbacks.onLog('Connecting to WhatsApp...');
-    connectionStatus = 'CONNECTING';
-    eventCallbacks.onStatusChange(connectionStatus);
-
-    sock = makeWASocket({
-      version,
-      logger: pino({ level: 'silent' }),
-      printQRInTerminal: false,
-      auth: state,
-      browser: Browsers.macOS('Desktop')
-    });
-
-    sock.ev.on('creds.update', saveCreds);
-
-    sock.ev.on('messages.update', (updates) => {
-      for (const update of updates) {
-        if (update.update && update.update.status) {
-          const statusVal = update.update.status;
-          const statusText = statusVal === 2 ? 'Sent to WhatsApp Server' : statusVal === 3 ? 'Delivered to Recipient Phone' : statusVal === 4 ? 'Read by Recipient' : `Status Code ${statusVal}`;
-          if (statusVal >= 2) {
-            eventCallbacks.onLog(`[Delivery ACK] Message ${update.key.id} -> ${statusText}`, 'success');
-          }
-        }
-      }
-    });
-
-    sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        qrCodeData = await QRCode.toDataURL(qr);
-        connectionStatus = 'QR_READY';
-        qrcodeTerminal.generate(qr, { small: true });
-        eventCallbacks.onLog('QR Code received. Please scan with WhatsApp.');
-        eventCallbacks.onQR(qrCodeData);
-        eventCallbacks.onStatusChange(connectionStatus);
-      }
-
-      if (connection === 'close') {
-        const statusCode = lastDisconnect?.error?.output?.statusCode;
-        const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut && !isLoggedOut;
-
-        connectionStatus = 'DISCONNECTED';
-        qrCodeData = null;
-        userInfo = null;
-        eventCallbacks.onStatusChange(connectionStatus);
-        eventCallbacks.onLog(`Connection closed due to: ${lastDisconnect?.error?.message || statusCode || 'Unknown'}. Reconnecting: ${shouldReconnect}`);
-
-        if (isLoggedOut) {
-          eventCallbacks.onLog('Session logged out or invalidated. Purging session and generating fresh QR code...', 'warning');
-          try {
-            if (fs.existsSync(sessionPath)) {
-              fs.rmSync(sessionPath, { recursive: true, force: true });
-            }
-          } catch (e) {
-            console.error('Failed to clear session path:', e);
-          }
-          setTimeout(() => initWhatsApp(sessionPath), 1500);
-        } else if (shouldReconnect) {
-          setTimeout(() => initWhatsApp(sessionPath), 3000);
-        }
-      } else if (connection === 'open') {
-        connectionStatus = 'CONNECTED';
-        qrCodeData = null;
-        userInfo = {
-          id: sock.user.id,
-          name: sock.user.name || 'WhatsApp User'
-        };
-        eventCallbacks.onLog(`Successfully connected to WhatsApp as ${userInfo.name} (${userInfo.id})`);
-        eventCallbacks.onStatusChange(connectionStatus, userInfo);
-      }
-    });
-
-    return sock;
-  } catch (error) {
-    console.error('Error initializing WhatsApp socket:', error);
-    eventCallbacks.onLog(`WhatsApp Connection Error: ${error.message}`);
-    connectionStatus = 'DISCONNECTED';
-    eventCallbacks.onStatusChange(connectionStatus);
+function getSessionsRootDir() {
+  const dir = path.join(__dirname, '../data/sessions');
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
   }
+  return dir;
+}
+
+function migrateLegacySessionIfNeeded() {
+  const rootDir = getSessionsRootDir();
+  const legacyCreds = path.join(rootDir, 'creds.json');
+  if (fs.existsSync(legacyCreds)) {
+    const acc1Dir = path.join(rootDir, 'acc_1');
+    if (!fs.existsSync(acc1Dir)) {
+      fs.mkdirSync(acc1Dir, { recursive: true });
+    }
+    const files = fs.readdirSync(rootDir);
+    for (const file of files) {
+      const fullPath = path.join(rootDir, file);
+      if (fs.statSync(fullPath).isFile()) {
+        try {
+          fs.renameSync(fullPath, path.join(acc1Dir, file));
+        } catch (e) {
+          console.error(`Failed to move ${file} to acc_1:`, e.message);
+        }
+      }
+    }
+    console.log('Migrated legacy WhatsApp session to acc_1');
+  }
+}
+
+async function initAccount(accountId, label) {
+  const rootDir = getSessionsRootDir();
+  const sessionPath = path.join(rootDir, accountId);
+  if (!fs.existsSync(sessionPath)) {
+    fs.mkdirSync(sessionPath, { recursive: true });
+  }
+
+  const accountNum = accountId.replace(/[^0-9]/g, '') || accountId;
+  const accountLabel = label || `Account ${accountNum}`;
+
+  let acc = accounts.get(accountId);
+  if (!acc) {
+    acc = {
+      id: accountId,
+      name: accountLabel,
+      sessionPath,
+      sock: null,
+      connectionStatus: 'DISCONNECTED',
+      qrCodeData: null,
+      userInfo: null
+    };
+    accounts.set(accountId, acc);
+  } else {
+    acc.name = accountLabel;
+  }
+
+  if (acc.sock) {
+    try { acc.sock.ev.removeAllListeners(); } catch (e) {}
+    try { acc.sock.end(undefined); } catch (e) {}
+    acc.sock = null;
+  }
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  let version;
+  try {
+    const versionRes = await fetchLatestBaileysVersion();
+    version = versionRes.version;
+  } catch (e) {
+    console.warn('Could not fetch latest Baileys version, using fallback:', e.message);
+    version = [2, 3000, 1015901307];
+  }
+
+  acc.connectionStatus = 'CONNECTING';
+  eventCallbacks.onLog(`[${acc.name}] Connecting to WhatsApp...`);
+  notifyAccountsUpdate();
+
+  const sock = makeWASocket({
+    version,
+    logger: pino({ level: 'silent' }),
+    printQRInTerminal: false,
+    auth: state,
+    browser: Browsers.macOS(`Desktop-${accountId}`)
+  });
+
+  acc.sock = sock;
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('messages.update', (updates) => {
+    for (const update of updates) {
+      if (update.update && update.update.status) {
+        const statusVal = update.update.status;
+        const statusText = statusVal === 2 ? 'Sent to WhatsApp Server' : statusVal === 3 ? 'Delivered to Recipient Phone' : statusVal === 4 ? 'Read by Recipient' : `Status Code ${statusVal}`;
+        if (statusVal >= 2) {
+          eventCallbacks.onLog(`[Delivery ACK - ${acc.name}] Message ${update.key.id} -> ${statusText}`, 'success');
+        }
+      }
+    }
+  });
+
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      acc.qrCodeData = await QRCode.toDataURL(qr);
+      acc.connectionStatus = 'QR_READY';
+      qrcodeTerminal.generate(qr, { small: true });
+      eventCallbacks.onLog(`[${acc.name}] QR Code ready. Please scan with WhatsApp.`);
+      eventCallbacks.onQR(accountId, acc.qrCodeData);
+      notifyAccountsUpdate();
+    }
+
+    if (connection === 'close') {
+      const statusCode = lastDisconnect?.error?.output?.statusCode;
+      const isLoggedOut = statusCode === DisconnectReason.loggedOut || statusCode === 401 || statusCode === 403;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut && !isLoggedOut;
+
+      acc.connectionStatus = 'DISCONNECTED';
+      acc.qrCodeData = null;
+      acc.userInfo = null;
+      notifyAccountsUpdate();
+      eventCallbacks.onLog(`[${acc.name}] Connection closed: ${lastDisconnect?.error?.message || statusCode || 'Unknown'}. Reconnecting: ${shouldReconnect}`);
+
+      if (isLoggedOut) {
+        eventCallbacks.onLog(`[${acc.name}] Session logged out. Clearing session files...`, 'warning');
+        try {
+          if (fs.existsSync(sessionPath)) {
+            fs.rmSync(sessionPath, { recursive: true, force: true });
+          }
+        } catch (e) {
+          console.error(`[${acc.name}] Error clearing session path:`, e.message);
+        }
+        setTimeout(() => initAccount(accountId, accountLabel), 1500);
+      } else if (shouldReconnect) {
+        setTimeout(() => initAccount(accountId, accountLabel), 3000);
+      }
+    } else if (connection === 'open') {
+      acc.connectionStatus = 'CONNECTED';
+      acc.qrCodeData = null;
+      const rawUser = sock.user;
+      const userPhone = rawUser?.id ? rawUser.id.split(':')[0] : '';
+      const userName = rawUser?.name || userPhone || acc.name;
+
+      acc.userInfo = {
+        id: rawUser?.id || '',
+        phone: userPhone,
+        name: userName
+      };
+      eventCallbacks.onLog(`[${acc.name}] Connected as ${acc.userInfo.name} (${acc.userInfo.phone})`, 'success');
+      notifyAccountsUpdate();
+    }
+  });
+
+  return sock;
+}
+
+async function initAllAccounts() {
+  migrateLegacySessionIfNeeded();
+  const rootDir = getSessionsRootDir();
+  const entries = fs.readdirSync(rootDir, { withFileTypes: true });
+  const accountDirs = entries.filter(e => e.isDirectory()).map(e => e.name);
+
+  if (accountDirs.length === 0) {
+    accountDirs.push('acc_1');
+  }
+
+  for (const accDir of accountDirs) {
+    const numMatch = accDir.match(/\d+/);
+    const label = numMatch ? `Account ${numMatch[0]}` : accDir;
+    await initAccount(accDir, label);
+  }
+}
+
+async function addNewAccount() {
+  const rootDir = getSessionsRootDir();
+  let maxId = 0;
+
+  for (const [id] of accounts) {
+    const match = id.match(/\d+/);
+    if (match) {
+      const num = parseInt(match[0], 10);
+      if (num > maxId) maxId = num;
+    }
+  }
+
+  if (fs.existsSync(rootDir)) {
+    const entries = fs.readdirSync(rootDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.isDirectory()) {
+        const match = entry.name.match(/\d+/);
+        if (match) {
+          const num = parseInt(match[0], 10);
+          if (num > maxId) maxId = num;
+        }
+      }
+    }
+  }
+
+  const newId = `acc_${maxId + 1}`;
+  const newLabel = `Account ${maxId + 1}`;
+  await initAccount(newId, newLabel);
+  notifyAccountsUpdate();
+  return getAccountStatus(newId);
+}
+
+async function logoutAccount(accountId) {
+  const acc = accounts.get(accountId);
+  if (!acc) return false;
+
+  if (acc.sock) {
+    try { await acc.sock.logout(); } catch(e){}
+    try { acc.sock.end(undefined); } catch(e){}
+    acc.sock = null;
+  }
+  acc.connectionStatus = 'DISCONNECTED';
+  acc.qrCodeData = null;
+  acc.userInfo = null;
+
+  if (fs.existsSync(acc.sessionPath)) {
+    try { fs.rmSync(acc.sessionPath, { recursive: true, force: true }); } catch(e){}
+  }
+
+  eventCallbacks.onLog(`[${acc.name}] Session cleared. Resetting for fresh QR...`, 'warning');
+  notifyAccountsUpdate();
+
+  setTimeout(() => {
+    initAccount(accountId, acc.name);
+  }, 1000);
+
+  return true;
+}
+
+async function removeAccount(accountId) {
+  const acc = accounts.get(accountId);
+  if (!acc) return false;
+
+  if (acc.sock) {
+    try { await acc.sock.logout(); } catch(e){}
+    try { acc.sock.end(undefined); } catch(e){}
+    acc.sock = null;
+  }
+
+  if (fs.existsSync(acc.sessionPath)) {
+    try { fs.rmSync(acc.sessionPath, { recursive: true, force: true }); } catch(e){}
+  }
+
+  accounts.delete(accountId);
+  eventCallbacks.onLog(`[${acc.name}] Removed WhatsApp account.`, 'warning');
+  notifyAccountsUpdate();
+  return true;
 }
 
 /**
@@ -137,59 +284,55 @@ function formatJID(phoneNumber) {
 }
 
 /**
- * Send message (text, image, or video) to a specific number with typing simulation and fallback
+ * Send message via specified accountId (or fallback to any connected account)
  */
-async function sendMessage(phoneNumber, text, media = null) {
-  if (!sock || connectionStatus !== 'CONNECTED') {
-    throw new Error('WhatsApp is NOT connected. Please scan the QR code first!');
+async function sendMessage(accountIdOrPhone, phoneNumber, text, media = null) {
+  let accountId = accountIdOrPhone;
+  let targetPhone = phoneNumber;
+  let msgText = text;
+
+  // Handle signature overloading if accountId was omitted: sendMessage(phone, text, media)
+  if (typeof targetPhone === 'string' && typeof msgText === 'undefined' && media === null) {
+    msgText = targetPhone;
+    targetPhone = accountIdOrPhone;
+    accountId = null;
+  } else if (typeof msgText === 'undefined' || (targetPhone && typeof targetPhone === 'object')) {
+    // Legacy call: sendMessage(phoneNumber, text, media)
+    media = text;
+    msgText = targetPhone;
+    targetPhone = accountIdOrPhone;
+    accountId = null;
   }
 
-  const digits = String(phoneNumber || '').replace(/[^0-9]/g, '');
+  let acc = accountId ? accounts.get(accountId) : null;
+
+  if (!acc || acc.connectionStatus !== 'CONNECTED') {
+    const connected = getConnectedAccounts();
+    if (connected.length === 0) {
+      throw new Error('No WhatsApp account is connected. Please scan QR code for at least one account!');
+    }
+    acc = accounts.get(connected[0].id);
+  }
+
+  const digits = String(targetPhone || '').replace(/[^0-9]/g, '');
   if (!digits || digits.length < 7) {
-    throw new Error(`Invalid phone number "${phoneNumber}". Please include international country code (e.g. +91... or +1...).`);
+    throw new Error(`Invalid phone number "${targetPhone}". Please include international country code (e.g. +91... or +1...).`);
   }
 
   let targetJid = `${digits}@s.whatsapp.net`;
 
-  // Verify on WhatsApp network
+  // Typing simulation
   try {
-    const results = await sock.onWhatsApp(digits);
-    if (results && results.length > 0 && results[0].exists) {
-      targetJid = results[0].jid;
-      eventCallbacks.onLog(`Verified +${digits} exists on WhatsApp (${targetJid})`);
-    } else {
-      throw new Error(`Phone number +${digits} is NOT registered on WhatsApp or country code is missing/invalid.`);
-    }
-  } catch (e) {
-    if (e.message.includes('NOT registered')) {
-      throw e;
-    }
-    console.warn(`onWhatsApp check warning for ${digits}:`, e.message);
-  }
-
-  // Check if sending to self
-  const senderNumber = sock.user?.id ? sock.user.id.split(':')[0].replace(/[^0-9]/g, '') : '';
-  const isSelf = senderNumber && (digits === senderNumber || targetJid.startsWith(senderNumber));
-  if (isSelf) {
-    eventCallbacks.onLog(`ℹ️ Sending test message to your OWN WhatsApp number (+${digits}). Note: Self-messages appear under the "(You)" / "Message Yourself" chat on WhatsApp, without triggering an incoming push notification.`, 'warning');
-  }
-
-  // Simulate human typing presence
-  try {
-    await sock.sendPresenceUpdate('composing', targetJid);
-    const typingTimeMs = Math.floor(Math.random() * 1000) + 1000;
+    await acc.sock.sendPresenceUpdate('composing', targetJid);
+    const typingTimeMs = Math.floor(Math.random() * 1000) + 800;
     await new Promise(res => setTimeout(res, typingTimeMs));
-    await sock.sendPresenceUpdate('paused', targetJid);
-  } catch (e) {
-    // Ignore presence errors
-  }
+    await acc.sock.sendPresenceUpdate('paused', targetJid);
+  } catch (e) {}
 
-  // Build payload based on media attachment type
-  let messagePayload = { text: text || '' };
+  let messagePayload = { text: (msgText || '').trim() };
 
   if (media && (media.buffer || media.path)) {
     let mediaBuffer = null;
-
     if (media.path && fs.existsSync(media.path)) {
       mediaBuffer = fs.readFileSync(media.path);
     } else if (media.buffer) {
@@ -225,13 +368,13 @@ async function sendMessage(phoneNumber, text, media = null) {
         image: mediaBuffer,
         mimetype: imageMime
       };
-      if (text && text.trim()) messagePayload.caption = text.trim();
+      if (msgText && msgText.trim()) messagePayload.caption = msgText.trim();
     } else if (isVideo) {
       messagePayload = {
         video: mediaBuffer,
         mimetype: 'video/mp4'
       };
-      if (text && text.trim()) messagePayload.caption = text.trim();
+      if (msgText && msgText.trim()) messagePayload.caption = msgText.trim();
     } else if (isAudio) {
       let audioMime = 'audio/mp4';
       if (mime.includes('ogg') || fileName.endsWith('.ogg')) {
@@ -243,71 +386,89 @@ async function sendMessage(phoneNumber, text, media = null) {
         ptt: false
       };
     } else {
-      // General document fallback (PDF, DOCX, ZIP, etc.)
       const docMime = media.mimetype && media.mimetype !== 'application/octet-stream' ? media.mimetype : 'application/pdf';
       messagePayload = {
         document: mediaBuffer,
         mimetype: docMime,
         fileName: media.fileName || 'document.pdf'
       };
-      if (text && text.trim()) messagePayload.caption = text.trim();
+      if (msgText && msgText.trim()) messagePayload.caption = msgText.trim();
     }
 
-    const sent = await sock.sendMessage(targetJid, messagePayload);
-    eventCallbacks.onLog(`Successfully delivered media to ${targetJid} (Message ID: ${sent?.key?.id || 'OK'})`, 'success');
+    const sent = await acc.sock.sendMessage(targetJid, messagePayload);
+    eventCallbacks.onLog(`[${acc.name}] Delivered media to ${targetJid} (Msg ID: ${sent?.key?.id || 'OK'})`, 'success');
     return sent;
   }
 
-  // Send text-only message
-  const sent = await sock.sendMessage(targetJid, messagePayload);
-  eventCallbacks.onLog(`Successfully delivered to ${targetJid} (Message ID: ${sent?.key?.id || 'OK'})`, 'success');
-  return sent;
+  const sent = await acc.sock.sendMessage(targetJid, messagePayload);
+  eventCallbacks.onLog(`[${acc.name}] Delivered to ${targetJid} (Msg ID: ${sent?.key?.id || 'OK'})`, 'success');
   return sent;
 }
 
-async function logoutWhatsApp() {
-  try {
-    if (sock) {
-      try { await sock.logout(); } catch(e){}
-      try { sock.end(undefined); } catch(e){}
-      sock = null;
-    }
-    connectionStatus = 'DISCONNECTED';
-    qrCodeData = null;
-    userInfo = null;
-
-    const sessionPath = path.join(__dirname, '../data/sessions');
-    if (fs.existsSync(sessionPath)) {
-      fs.rmSync(sessionPath, { recursive: true, force: true });
-    }
-
-    eventCallbacks.onLog('Session cleared. Resetting WhatsApp connection for fresh QR code...', 'warning');
-    eventCallbacks.onStatusChange(connectionStatus);
-
-    setTimeout(() => {
-      initWhatsApp();
-    }, 1500);
-
-    return true;
-  } catch (error) {
-    console.error('Error during logout:', error);
-    throw error;
-  }
-}
-
-function getStatus() {
+function getAccountStatus(accountId) {
+  const acc = accounts.get(accountId);
+  if (!acc) return null;
   return {
-    status: connectionStatus,
-    qrCode: qrCodeData,
-    user: userInfo
+    id: acc.id,
+    name: acc.name,
+    status: acc.connectionStatus,
+    qrCode: acc.qrCodeData,
+    user: acc.userInfo
   };
 }
 
+function getAllAccountsStatus() {
+  const list = [];
+  for (const acc of accounts.values()) {
+    list.push({
+      id: acc.id,
+      name: acc.name,
+      status: acc.connectionStatus,
+      qrCode: acc.qrCodeData,
+      user: acc.userInfo
+    });
+  }
+  return list;
+}
+
+function getConnectedAccounts() {
+  return getAllAccountsStatus().filter(a => a.status === 'CONNECTED');
+}
+
+function getStatus() {
+  const connected = getConnectedAccounts();
+  return {
+    status: connected.length > 0 ? 'CONNECTED' : 'DISCONNECTED',
+    accounts: getAllAccountsStatus(),
+    connectedCount: connected.length
+  };
+}
+
+function notifyAccountsUpdate() {
+  const list = getAllAccountsStatus();
+  if (eventCallbacks.onAccountsUpdate) eventCallbacks.onAccountsUpdate(list);
+  if (eventCallbacks.onStatusChange) eventCallbacks.onStatusChange(getStatus());
+}
+
+async function logoutWhatsApp() {
+  for (const [id] of accounts.keys()) {
+    await logoutAccount(id);
+  }
+  return true;
+}
+
 module.exports = {
-  initWhatsApp,
+  initAccount,
+  initAllAccounts,
+  addNewAccount,
+  logoutAccount,
+  removeAccount,
   sendMessage,
-  logoutWhatsApp,
   getStatus,
+  getAccountStatus,
+  getAllAccountsStatus,
+  getConnectedAccounts,
   setEventCallbacks,
-  formatJID
+  formatJID,
+  logoutWhatsApp
 };

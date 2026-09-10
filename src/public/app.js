@@ -51,32 +51,118 @@ function addLog(msg, type='info', ts=new Date().toLocaleTimeString()) {
   $('logs-box').scrollTop = $('logs-box').scrollHeight;
 }
 
-function setStatus(p={}) {
-  const s = p.status || 'DISCONNECTED';
-  const l = { CONNECTED: 'Connected', QR_READY: 'Scan QR Code', CONNECTING: 'Connecting...', DISCONNECTED: 'Disconnected' };
-  const cl = { CONNECTED: 'text-emerald-400', QR_READY: 'text-amber-400 font-bold', CONNECTING: 'text-amber-400', DISCONNECTED: 'text-rose-400' };
-  
-  if ($('wa-status-text')) $('wa-status-text').textContent = l[s] || s;
-  if ($('wa-status-badge')) $('wa-status-badge').className = `flex items-center space-x-2.5 px-4 py-2 rounded-full bg-slate-900/90 border border-slate-700/80 text-xs font-semibold ${cl[s] || 'text-slate-400'} shadow-inner`;
+function renderAccountsGrid(accounts = []) {
+  accountsList = accounts;
+  const grid = $('accounts-grid');
+  if (!grid) return;
 
-  if (s === 'QR_READY') {
-    $('qr-card').classList.remove('hidden');
-    $('account-card').classList.add('hidden');
-    if (p.qrCode && $('qr-image')) {
-      $('qr-image').src = p.qrCode;
-    }
-  } else if (s === 'CONNECTED') {
-    $('qr-card').classList.add('hidden');
-    $('account-card').classList.remove('hidden');
-    if (p.user) {
-      if ($('account-name')) $('account-name').textContent = p.user.name || 'Connected User';
-      if ($('account-id')) $('account-id').textContent = p.user.id || 'Active Session';
-    }
-  } else {
-    $('qr-card').classList.add('hidden');
-    $('account-card').classList.add('hidden');
+  const connected = accounts.filter(a => a.status === 'CONNECTED');
+  const connectedCount = connected.length;
+
+  if ($('wa-status-text')) {
+    $('wa-status-text').textContent = connectedCount > 0 ? `${connectedCount} Account${connectedCount > 1 ? 's' : ''} Ready` : 'Disconnected';
+  }
+  if ($('wa-status-badge')) {
+    $('wa-status-badge').className = `flex items-center space-x-2.5 px-4 py-2 rounded-full bg-slate-900/90 border border-slate-700/80 text-xs font-semibold ${connectedCount > 0 ? 'text-emerald-400 font-bold' : 'text-rose-400'} shadow-inner`;
+  }
+
+  if (!accounts.length) {
+    grid.innerHTML = `
+      <div class="col-span-2 p-6 glass-card rounded-xl text-center text-slate-400 text-xs italic">
+        No WhatsApp accounts added. Click "+ Add WhatsApp Account" to start.
+      </div>`;
+    return;
+  }
+
+  grid.innerHTML = accounts.map((acc, index) => {
+    const isConnected = acc.status === 'CONNECTED';
+    const isQR = acc.status === 'QR_READY';
+    const statusCls = isConnected ? 'border-emerald-500/40 bg-emerald-950/20' : isQR ? 'border-amber-500/40 bg-amber-950/20' : 'border-slate-800 bg-slate-950/60';
+    const badgeCls = isConnected ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40' : isQR ? 'bg-amber-500/20 text-amber-300 border-amber-500/40 font-bold' : 'bg-slate-800 text-slate-400 border-slate-700';
+    const statusText = isConnected ? 'Active & Ready' : isQR ? 'Scan QR Code' : acc.status;
+
+    const qrBlock = isQR && acc.qrCode ? `
+      <div class="mt-3 p-3 bg-slate-950 rounded-xl border border-amber-500/30 flex flex-col items-center justify-center">
+        <img src="${acc.qrCode}" alt="WhatsApp QR Code" class="w-44 h-44 rounded-lg bg-white p-2 shadow-lg transition hover:scale-105 duration-300">
+        <span class="text-[10px] text-amber-400 mt-2 font-mono flex items-center gap-1.5">
+          <i class="fa-solid fa-arrows-rotate animate-spin text-amber-400"></i> Open WhatsApp > Linked Devices > Scan
+        </span>
+      </div>` : '';
+
+    const userBlock = isConnected && acc.user ? `
+      <div class="mt-2 text-xs font-mono text-emerald-300 flex items-center gap-1.5">
+        <i class="fa-solid fa-user-check text-emerald-400"></i> ${esc(acc.user.name || 'WhatsApp User')} ${acc.user.phone ? `(+${esc(acc.user.phone)})` : ''}
+      </div>` : '';
+
+    return `
+      <div class="glass-panel p-4 rounded-xl border ${statusCls} space-y-2 relative group">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-2.5">
+            <div class="w-8 h-8 rounded-lg ${isConnected ? 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40' : 'bg-slate-800 text-slate-400 border-slate-700'} flex items-center justify-center text-sm font-bold border">
+              <i class="fa-brands fa-whatsapp"></i>
+            </div>
+            <div>
+              <h3 class="text-xs font-bold text-white flex items-center gap-1.5 font-mono">${esc(acc.name)}</h3>
+              <span class="text-[10px] font-mono text-slate-400">${esc(acc.id)}</span>
+            </div>
+          </div>
+          <span class="text-[10px] font-mono font-semibold px-2.5 py-0.5 rounded-full border ${badgeCls}">${statusText}</span>
+        </div>
+
+        ${userBlock}
+        ${qrBlock}
+
+        <div class="flex items-center justify-end space-x-2 pt-2 border-t border-slate-800/60">
+          ${isConnected || isQR ? `
+            <button onclick="logoutAccount('${acc.id}')" class="px-2 py-1 text-[10px] font-mono font-bold bg-amber-500/10 hover:bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded-lg transition">
+              <i class="fa-solid fa-rotate mr-1"></i> Reset Session
+            </button>` : ''}
+          ${accounts.length > 1 ? `
+            <button onclick="removeAccount('${acc.id}')" class="px-2 py-1 text-[10px] font-mono font-bold bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border border-rose-500/30 rounded-lg transition">
+              <i class="fa-solid fa-trash mr-1"></i> Remove
+            </button>` : ''}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+async function addAccount() {
+  try {
+    addLog('Initializing new WhatsApp account session...', 'info');
+    const res = await fetchJSON('/api/accounts/add', { method: 'POST' });
+    renderAccountsGrid(res.accounts || []);
+    addLog(`Created new slot: ${res.account?.name || 'New Account'}. Please scan QR code.`, 'success');
+  } catch (err) {
+    addLog(`Failed adding account: ${err.message}`, 'error');
   }
 }
+
+async function logoutAccount(accountId) {
+  if (!confirm(`Reset session for account ${accountId}?`)) return;
+  try {
+    addLog(`Resetting session for ${accountId}...`, 'warning');
+    const res = await fetchJSON(`/api/accounts/${accountId}/logout`, { method: 'POST' });
+    renderAccountsGrid(res.accounts || []);
+    addLog(`Account ${accountId} session reset. Scan fresh QR code.`, 'info');
+  } catch (err) {
+    addLog(`Logout error: ${err.message}`, 'error');
+  }
+}
+
+async function removeAccount(accountId) {
+  if (!confirm(`Remove ${accountId} completely?`)) return;
+  try {
+    addLog(`Removing account ${accountId}...`, 'warning');
+    const res = await fetchJSON(`/api/accounts/${accountId}`, { method: 'DELETE' });
+    renderAccountsGrid(res.accounts || []);
+    addLog(`Account ${accountId} removed.`, 'info');
+  } catch (err) {
+    addLog(`Remove error: ${err.message}`, 'error');
+  }
+}
+
+window.logoutAccount = logoutAccount;
+window.removeAccount = removeAccount;
 
 function renderContacts() {
   $('contact-count-badge').textContent = `${contacts.length} loaded`;
@@ -362,14 +448,24 @@ $('btn-resume-send').addEventListener('click', () => queueAction('resume'));
 $('btn-stop-send').addEventListener('click', () => queueAction('stop'));
 $('btn-clear-logs').addEventListener('click', () => $('logs-box').innerHTML='');
 
-socket.on('waStatus', setStatus);
-socket.on('waQR', q => { $('qr-image').src=q; $('qr-card').classList.remove('hidden'); });
+const btnAddAcc = $('btn-add-account');
+if (btnAddAcc) {
+  btnAddAcc.addEventListener('click', addAccount);
+}
+
+socket.on('waAccounts', renderAccountsGrid);
+socket.on('waStatus', (data) => {
+  if (data.accounts) renderAccountsGrid(data.accounts);
+});
 socket.on('queueProgress', renderProgress);
 socket.on('queueLog', i => addLog(i.message, i.type, i.timestamp));
 socket.on('systemLog', i => addLog(i.message, 'info', i.timestamp));
 
 fetchJSON('/api/status')
-  .then(d => { setStatus(d.whatsapp); renderProgress(d.queue); })
+  .then(d => {
+    if (d.accounts) renderAccountsGrid(d.accounts);
+    renderProgress(d.queue);
+  })
   .catch(() => addLog('Unable to reach server.', 'error'));
 
 $('btn-toggle-manual').addEventListener('click', () => $('manual-paste-area').classList.toggle('hidden'));

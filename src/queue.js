@@ -1,4 +1,4 @@
-const { sendMessage } = require('./whatsapp');
+const { sendMessage, getConnectedAccounts } = require('./whatsapp');
 const { generateAIMessage } = require('./ai');
 
 function extractPhone(clientObj) {
@@ -160,8 +160,22 @@ class QueueManager {
       return;
     }
 
+    const connectedAccounts = getConnectedAccounts();
+    if (connectedAccounts.length === 0) {
+      this.log('No active/connected WhatsApp accounts available! Pausing batch execution.', 'error');
+      this.pause();
+      return;
+    }
+
+    // Select account using Round-Robin across active connected WhatsApp accounts
+    const accountIndex = this.currentIndex % connectedAccounts.length;
+    const selectedAccount = connectedAccounts[accountIndex];
+    const accLabel = selectedAccount.user?.name || selectedAccount.name || selectedAccount.id;
+
     const currentItem = this.queue[this.currentIndex];
     currentItem.status = 'PROCESSING';
+    currentItem.sentByAccount = accLabel;
+    currentItem.sentByAccountId = selectedAccount.id;
     this.emitProgress();
 
     const rawPhone = extractPhone(currentItem.client);
@@ -196,7 +210,7 @@ class QueueManager {
     }
 
     try {
-      this.log(`[${currentItem.id}/${this.queue.length}] Tailoring message for ${currentItem.client.name || clientPhone}...`, 'info');
+      this.log(`[${currentItem.id}/${this.queue.length}] Tailoring message for ${currentItem.client.name || clientPhone} (via ${accLabel})...`, 'info');
       
       const finalMessage = await generateAIMessage({
         template: currentItem.template,
@@ -207,18 +221,18 @@ class QueueManager {
       });
 
       currentItem.generatedMessage = finalMessage;
-      this.log(`Sending to ${clientPhone}${this.config.media ? ' [with media]' : ''}...`, 'info');
+      this.log(`[${accLabel}] Sending to ${clientPhone}${this.config.media ? ' [with media]' : ''}...`, 'info');
 
-      await sendMessage(clientPhone, finalMessage, this.config.media);
+      await sendMessage(selectedAccount.id, clientPhone, finalMessage, this.config.media);
 
       currentItem.status = 'SENT';
       currentItem.sentAt = new Date().toISOString();
-      this.log(`Message sent to ${clientPhone} (${currentItem.client.name || 'Client'})`, 'success');
+      this.log(`[${accLabel}] Message sent to ${clientPhone} (${currentItem.client.name || 'Client'})`, 'success');
 
     } catch (err) {
       currentItem.status = 'FAILED';
       currentItem.error = err.message;
-      this.log(`Failed sending to ${clientPhone}: ${err.message}`, 'error');
+      this.log(`[${accLabel}] Failed sending to ${clientPhone}: ${err.message}`, 'error');
     }
 
     this.currentIndex++;
@@ -232,7 +246,7 @@ class QueueManager {
         clearTimeout(this.timerId);
         this.timerId = null;
       }
-      this.log(`Batch complete! Finished processing ${this.queue.length} contacts.`, 'success');
+      this.log(`Batch complete! Finished processing ${this.queue.length} contacts across ${connectedAccounts.length} WhatsApp accounts.`, 'success');
       this.emitProgress();
     }
   }

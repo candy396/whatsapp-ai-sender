@@ -100,39 +100,23 @@
   <main class="flex-1 max-w-7xl w-full mx-auto p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 overflow-y-auto custom-scrollbar">
     <div class="lg:col-span-7 flex flex-col space-y-6">
       
-      <!-- QR Card -->
-      <div id="qr-card" class="glass-panel rounded-2xl p-6 border border-amber-500/30 hidden">
-        <div class="flex items-center justify-between mb-4">
-          <h2 class="text-sm font-bold text-amber-400 uppercase tracking-wider flex items-center gap-2 font-mono">
-            <i class="fa-solid fa-qrcode text-lg"></i> Link Device Required
-          </h2>
-          <span class="text-[11px] text-slate-400">Scan via WhatsApp &gt; Linked Devices</span>
-        </div>
-        <div class="flex flex-col items-center justify-center p-6 bg-slate-950/80 rounded-xl border border-slate-800 shadow-inner">
-          <img id="qr-image" class="w-52 h-52 rounded-xl bg-white p-3 shadow-2xl transition hover:scale-105 duration-300" src="" alt="WhatsApp QR Code">
-          <p class="text-xs text-slate-400 mt-4 flex items-center gap-2 font-mono">
-            <i class="fa-solid fa-arrows-rotate animate-spin text-emerald-400"></i> Waiting for WhatsApp scan...
-          </p>
-        </div>
-      </div>
-
-      <!-- Account Active Card -->
-      <div id="account-card" class="glass-panel rounded-2xl p-4 border border-emerald-500/30 hidden flex items-center justify-between bg-emerald-950/20">
-        <div class="flex items-center space-x-3.5">
-          <div class="relative">
-            <div class="w-10 h-10 rounded-full bg-emerald-500/20 text-emerald-400 flex items-center justify-center text-lg border border-emerald-500/40">
-              <i class="fa-solid fa-shield-halved"></i>
-            </div>
-            <span class="absolute bottom-0 right-0 w-3 h-3 bg-emerald-500 border-2 border-slate-950 rounded-full"></span>
-          </div>
+      <!-- WhatsApp Accounts Hub (Multi-Account Round-Robin) -->
+      <div class="glass-panel rounded-2xl p-6 border border-emerald-500/30 space-y-4">
+        <div class="flex items-center justify-between">
           <div>
-            <div class="text-sm font-bold text-white flex items-center gap-2" id="account-name">Connected User</div>
-            <div class="text-xs font-mono text-emerald-400/90" id="account-id">Active Session</div>
+            <h2 class="text-sm font-bold text-white uppercase tracking-wider flex items-center gap-2 font-mono">
+              <i class="fa-brands fa-whatsapp text-emerald-400 text-lg"></i> WhatsApp Accounts Hub
+            </h2>
+            <p class="text-xs text-slate-400 mt-0.5">Round-Robin Alternating Dispatcher across connected accounts</p>
           </div>
+          <button id="btn-add-account" class="px-3.5 py-2 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border border-emerald-500/40 text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow-sm">
+            <i class="fa-solid fa-plus text-emerald-400"></i> Add WhatsApp Account
+          </button>
         </div>
-        <span class="text-xs font-semibold bg-emerald-500/20 text-emerald-300 border border-emerald-500/40 px-3.5 py-1 rounded-full flex items-center gap-1.5 font-mono">
-          <i class="fa-solid fa-check-double"></i> Socket Ready
-        </span>
+
+        <div id="accounts-grid" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <!-- Dynamically rendered account cards -->
+        </div>
       </div>
 
       <!-- Step 1: Contacts Matrix -->
@@ -422,6 +406,7 @@
                 <th class="p-2.5">#</th>
                 <th class="p-2.5">Phone</th>
                 <th class="p-2.5">Name</th>
+                <th class="p-2.5">WhatsApp Account</th>
                 <th class="p-2.5">Status</th>
               </tr>
             </thead>

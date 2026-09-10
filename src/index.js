@@ -5,7 +5,17 @@ const multer = require('multer');
 const path = require('path');
 require('dotenv').config();
 
-const { initWhatsApp, getStatus: getWAStatus, logoutWhatsApp, setEventCallbacks } = require('./whatsapp');
+const {
+  initAllAccounts,
+  addNewAccount,
+  logoutAccount,
+  removeAccount,
+  getAllAccountsStatus,
+  getConnectedAccounts,
+  getStatus: getWAStatus,
+  logoutWhatsApp,
+  setEventCallbacks
+} = require('./whatsapp');
 const { generateAIMessage } = require('./ai');
 const queueManager = require('./queue');
 const { parseCSVBuffer, parseJSONString } = require('./csv');
@@ -26,15 +36,20 @@ queueManager.setSocketIO(io);
 
 // Setup WhatsApp Event Callbacks for socket updates
 setEventCallbacks({
-  onQR: (qrCodeData) => {
-    io.emit('waQR', qrCodeData);
+  onQR: () => {
+    io.emit('waAccounts', getAllAccountsStatus());
     io.emit('waStatus', getWAStatus());
   },
-  onStatusChange: (status, user) => {
+  onStatusChange: () => {
+    io.emit('waAccounts', getAllAccountsStatus());
     io.emit('waStatus', getWAStatus());
   },
-  onLog: (msg) => {
-    io.emit('systemLog', { timestamp: new Date().toLocaleTimeString(), message: msg });
+  onAccountsUpdate: (accountsList) => {
+    io.emit('waAccounts', accountsList);
+    io.emit('waStatus', getWAStatus());
+  },
+  onLog: (msg, type = 'info') => {
+    io.emit('systemLog', { timestamp: new Date().toLocaleTimeString(), message: msg, type });
   }
 });
 
@@ -42,18 +57,48 @@ setEventCallbacks({
 io.on('connection', (socket) => {
   console.log('Web client connected:', socket.id);
   // Send initial state on connection
+  socket.emit('waAccounts', getAllAccountsStatus());
   socket.emit('waStatus', getWAStatus());
   socket.emit('queueProgress', queueManager.getStatus());
 });
 
 // API Routes
 
-// 1. Get Status
+// 1. Get Status & Accounts
 app.get('/api/status', (req, res) => {
   res.json({
     whatsapp: getWAStatus(),
+    accounts: getAllAccountsStatus(),
     queue: queueManager.getStatus()
   });
+});
+
+// Accounts Management Endpoints
+app.post('/api/accounts/add', async (req, res) => {
+  try {
+    const account = await addNewAccount();
+    res.json({ success: true, account, accounts: getAllAccountsStatus() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/accounts/:id/logout', async (req, res) => {
+  try {
+    await logoutAccount(req.params.id);
+    res.json({ success: true, message: `Account ${req.params.id} logged out.`, accounts: getAllAccountsStatus() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/accounts/:id', async (req, res) => {
+  try {
+    await removeAccount(req.params.id);
+    res.json({ success: true, message: `Account ${req.params.id} removed.`, accounts: getAllAccountsStatus() });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // 2. Parse CSV / Contacts upload
@@ -133,9 +178,9 @@ app.post('/api/send-batch', (req, res) => {
         return res.status(400).json({ error: 'Message template or media attachment is required.' });
       }
 
-      const waStatus = getWAStatus();
-      if (waStatus.status !== 'CONNECTED') {
-        return res.status(400).json({ error: 'WhatsApp is not connected. Please scan QR code first.' });
+      const connected = getConnectedAccounts();
+      if (connected.length === 0) {
+        return res.status(400).json({ error: 'No WhatsApp account is connected. Please scan QR code for at least one account.' });
       }
 
       let media = null;
@@ -195,11 +240,11 @@ app.use((err, req, res, next) => {
 });
 
 // Start WhatsApp and Express Server
-server.listen(PORT, () => {
+server.listen(PORT, async () => {
   console.log(`\n==================================================`);
   console.log(`🚀 AI WhatsApp Tool Server listening on http://localhost:${PORT}`);
   console.log(`==================================================\n`);
   
-  // Initialize WhatsApp connection
-  initWhatsApp();
+  // Initialize all WhatsApp account connections
+  await initAllAccounts();
 });
